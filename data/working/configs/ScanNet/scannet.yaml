@@ -1,11 +1,13 @@
+# OVO-SLAM ScanNet camera config patched for the keyframe pipeline.
+# Modified from the original to match the rough specs of the camera
 dataset_name: "scannet"
-cam: 
-  H: 480 
-  W: 640
-  fx: 577.590698
-  fy: 578.729797
-  cx: 318.905426
-  cy: 242.683609
+cam:
+  H: 720
+  W: 1280
+  fx: 610.8327
+  fy: 458.1246
+  cx: 640.0
+  cy: 360.0
   depth_scale: 1000.
-  depth_th: 4. # in m
-  crop_edge: 12
+  depth_th: 8.0
+  crop_edge: 0

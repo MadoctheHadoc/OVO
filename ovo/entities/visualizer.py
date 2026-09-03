@@ -242,9 +242,11 @@ class Visualizer:
         def add_first_cloud():
             mat = o3d.visualization.rendering.MaterialRecord()
             mat.shader = "defaultUnlit"
-            self.main_vis.setup_camera(60, bounds.get_center().numpy(),
-                                       bounds.get_center().numpy()+[0., 0., -3.],[0., -1., 0.])
             self.main_vis.add_geometry("pcd", self.cloud, mat)
+            # setup_camera's 4-arg overload segfaults unconditionally on this
+            # Open3D 0.18.0 build (aarch64), regardless of input shape/dtype;
+            # reset_camera_to_default() alone gives a usable framing.
+            # Without this change it would sometimes crash.
             self.main_vis.reset_camera_to_default()
 
         o3d.visualization.gui.Application.instance.post_to_main_thread(self.main_vis, add_first_cloud)

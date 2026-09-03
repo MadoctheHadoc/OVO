@@ -18,7 +18,8 @@ from ovo.entities.ovo import OVO
 
 def load_representation(scene_path: Path, eval: bool=False, debug_info: bool=False) -> OVO:
     config = io_utils.load_config(scene_path / "config.yaml", inherit=False)
-    submap_ckpt = torch.load(scene_path /"ovo_map.ckpt" )
+    # Why wouldn't we be more specific here;
+    submap_ckpt = torch.load(scene_path /"ovo_map.ckpt", weights_only=False)
     map_params = submap_ckpt.get("map_params", None)
     if map_params is None:
         map_params = submap_ckpt["gaussian_params"]        
