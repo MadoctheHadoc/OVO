@@ -13,6 +13,19 @@ class VanillaMapper():
         self.max_frame_points = config["mapping"].get("max_frame_points", 1e5)
 
         self.match_distance_th = 0.03 # 3 cm
+
+        # Per-keyframe LiDAR: when enabled and the dataset provides a sweep
+        # (camera optical frame), the frame's 3D points come from the sweep
+        # instead of unprojecting the depth image. The sweep is rasterised to a
+        # sparse depth image so the existing occlusion/dedup path is reused
+        # unchanged (nearest return wins per pixel; negligible loss at Mid-360
+        # density). Falls back to depth unprojection when no sweep is present.
+        self.use_lidar = config["mapping"].get("use_lidar", False)
+        cam_cfg = config.get("cam", {})
+        depth_th = cam_cfg.get("depth_th", 0)
+        self.lidar_depth_th = depth_th if depth_th and depth_th > 0 else None
+        self.lidar_crop_edge = cam_cfg.get("crop_edge", 0)
+
         self.max_id = 0
         self.estimated_c2ws = dict()  
         self.kfs = {}   
@@ -51,7 +64,11 @@ class VanillaMapper():
         w = image.shape[1]
         # create point cloud
         y, x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
-        depth  = torch.from_numpy(depth.astype(np.float32)).to(self.device)
+        lidar = frame_data[5] if len(frame_data) > 5 else None
+        if self.use_lidar and lidar is not None and len(lidar) > 0:
+            depth = self._rasterize_lidar(lidar, h, w)
+        else:
+            depth  = torch.from_numpy(depth.astype(np.float32)).to(self.device)
         mask = depth > 0
         
         if self.max_id>0:
@@ -84,6 +101,31 @@ class VanillaMapper():
         self.pcd_colors = torch.vstack((self.pcd_colors, torch.from_numpy(image.astype(np.uint8)).to(self.device)[mask].reshape(-1,3)))
         self.max_id += points.shape[0]
             
+    def _rasterize_lidar(self, lidar_xyz: np.ndarray, h: int, w: int) -> torch.Tensor:
+        """Project a camera-frame LiDAR sweep into a sparse HxW depth image.
+
+        Points are dropped if behind the camera, beyond ``cam.depth_th``, or
+        projecting outside the (cropped) image. When several returns hit one
+        pixel the nearest is kept.
+        """
+        pts = torch.from_numpy(np.ascontiguousarray(lidar_xyz[:, :3])).float().to(self.device)
+        z = pts[:, 2]
+        fx, fy = self.cam_intrinsics[0, 0], self.cam_intrinsics[1, 1]
+        cx, cy = self.cam_intrinsics[0, 2], self.cam_intrinsics[1, 2]
+        u = torch.round(fx * pts[:, 0] / z + cx).long()
+        v = torch.round(fy * pts[:, 1] / z + cy).long()
+        edge = self.lidar_crop_edge
+        valid = (z > 0) & (u >= edge) & (u < w - edge) & (v >= edge) & (v < h - edge)
+        if self.lidar_depth_th is not None:
+            valid &= z <= self.lidar_depth_th
+        u, v, z = u[valid], v[valid], z[valid]
+        depth = torch.full((h * w,), float("inf"), device=self.device)
+        flat = v * w + u
+        order = torch.argsort(z, descending=True)  # farthest first -> nearest overwrites
+        depth[flat[order]] = z[order]
+        depth[torch.isinf(depth)] = 0.0
+        return depth.view(h, w)
+
     def get_c2w(self, frame_id: int) -> torch.Tensor:
         c2w = self.estimated_c2ws.get(frame_id, None)
         if c2w is not None and c2w.device != self.device:

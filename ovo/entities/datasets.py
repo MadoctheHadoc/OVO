@@ -86,6 +86,14 @@ class ScanNet(BaseDataset):
         self.depth_paths = sorted(list(
             (self.dataset_path / "depth").glob("*.png")), key=lambda x: int(os.path.basename(x)[:-4]))
         self.load_poses(self.dataset_path / "pose")
+        # Optional per-keyframe LiDAR sweep, when present it replaces the depth projection
+        lidar_dir = self.dataset_path / "lidar"
+        if lidar_dir.is_dir():
+            self.lidar_paths = sorted(
+                lidar_dir.glob("*.npy"),
+                key=lambda x: int(os.path.basename(x)[:-4]))
+        else:
+            self.lidar_paths = None
         depth_th = dataset_config.get("depth_th",0)
         if depth_th >0:
             self.depth_th = depth_th
@@ -123,6 +131,9 @@ class ScanNet(BaseDataset):
             lr_color_data = lr_color_data[edge:-edge, edge:-edge]
             depth_data = depth_data[edge:-edge, edge:-edge]
         # Interpolate depth values for splatting
+        if self.lidar_paths is not None:
+            lidar_data = np.load(self.lidar_paths[index]).astype(np.float32)
+            return index, lr_color_data, depth_data, self.poses[index], color_data, lidar_data
         return index, lr_color_data, depth_data, self.poses[index], color_data
 
 

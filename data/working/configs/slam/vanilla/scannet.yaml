@@ -3,5 +3,7 @@ mapping:
   max_frame_points: 1e5
   k_pooling: 3
   downscale_ratio: 2
+  # New parameter in the yaml governing whether the implementation should use LiDAR (or not, but if you're cloning this repo I don't know why you would want to turn it off)
+  use_lidar: true
 tracking:
   track_every: 1
