@@ -65,40 +65,63 @@ class VanillaMapper():
         # create point cloud
         y, x = torch.meshgrid(torch.arange(h, device=self.device), torch.arange(w, device=self.device), indexing="ij")
         lidar = frame_data[5] if len(frame_data) > 5 else None
-        if self.use_lidar and lidar is not None and len(lidar) > 0:
+        using_lidar = self.use_lidar and lidar is not None and len(lidar) > 0
+        if using_lidar:
             depth = self._rasterize_lidar(lidar, h, w)
         else:
             depth  = torch.from_numpy(depth.astype(np.float32)).to(self.device)
         mask = depth > 0
-        
+
         if self.max_id>0:
             camera_frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
-            frustum_mask = geometry_utils.compute_frustum_point_ids(self.pcd, camera_frustum_corners, device=self.device)                    
+            frustum_mask = geometry_utils.compute_frustum_point_ids(self.pcd, camera_frustum_corners, device=self.device)
             _, matches = geometry_utils.match_3d_points_to_2d_pixels(depth, torch.linalg.inv(c2w), self.pcd[frustum_mask], self.cam_intrinsics, self.match_distance_th)
             mask[matches[:,1], matches[:,0]] = False # Do not project depth on points alredy matched
-            mask = self.pooling(mask)
+            if not using_lidar:
+                # self.pooling is a 3x3 erosion that assumes a dense depth image;
+                # on the sparse rasterised LiDAR mask it wipes every isolated
+                # pixel, so from frame 1 on nothing would be added. The pixel
+                # dedup above still removes returns matching existing map points.
+                mask = self.pooling(mask)
 
         if mask.sum() == 0:
             return
-        
-        y, x = self.downscale(y), self.downscale(x)
-        depth, mask, image = self.downscale(depth), self.downscale(mask), self.downscale(image)
+
+        if not using_lidar:
+            # downscale (x[::2, ::2]) drops 3/4 of an already-sparse LiDAR mask.
+            y, x = self.downscale(y), self.downscale(x)
+            depth, mask, image = self.downscale(depth), self.downscale(mask), self.downscale(image)
 
         x = x[mask]
         y = y[mask]
         depth = depth[mask]
+        colors = torch.from_numpy(image.astype(np.uint8)).to(self.device)[mask].reshape(-1, 3)
         # convert to 3D
         x_3d = (x - self.cam_intrinsics[0, 2]) * depth / self.cam_intrinsics[0, 0]
         y_3d = (y - self.cam_intrinsics[1, 2]) * depth / self.cam_intrinsics[1, 1]
         z_3d = depth
-        
+
         points = torch.hstack((x_3d.reshape(-1, 1), y_3d.reshape(-1, 1), z_3d.reshape(-1, 1), torch.ones((x_3d.shape[0],1), device=self.device)))
         points = torch.einsum("ij,mj->mi",c2w, points)
+
+        if using_lidar and self.max_id > 0:
+            # Sparse-depth pixel dedup barely fires between overlapping sweeps;
+            # drop points within match_distance_th of an existing map point in 3D.
+            frustum_mask = geometry_utils.compute_frustum_point_ids(
+                self.pcd, camera_frustum_corners, device=self.device)
+            if frustum_mask.sum() > 0:
+                dup, _ = geometry_utils.match_3d_points(
+                    points[:, :3], self.pcd[frustum_mask], self.match_distance_th)
+                keep = ~dup.to(points.device)
+                points = points[keep]
+                colors = colors[keep]
+            if points.shape[0] == 0:
+                return
 
         self.pcd = torch.vstack((self.pcd, points[:,:3]))
         self.pcd_ids = torch.vstack((self.pcd_ids, torch.arange(self.max_id, self.max_id+points.shape[0], device=self.device, dtype=torch.int32).unsqueeze(1)))
         self.pcd_obj_ids = torch.vstack((self.pcd_obj_ids, torch.ones((points.shape[0],1), device=self.device, dtype=torch.int32)*-1))
-        self.pcd_colors = torch.vstack((self.pcd_colors, torch.from_numpy(image.astype(np.uint8)).to(self.device)[mask].reshape(-1,3)))
+        self.pcd_colors = torch.vstack((self.pcd_colors, colors))
         self.max_id += points.shape[0]
             
     def _rasterize_lidar(self, lidar_xyz: np.ndarray, h: int, w: int) -> torch.Tensor:
