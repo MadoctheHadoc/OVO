@@ -62,7 +62,8 @@ def compute_scene_labels(scene_path: Path, dataset_name: str, scene_name: str, d
     del ovo
 
 
-def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, depth_filter: bool = None) -> None:
+def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = False, depth_filter: bool = None,
+              online: bool = False, input_path: str = None) -> None:
 
     config = io_utils.load_config("data/working/configs/ovo.yaml")
     map_module = config["slam"]["slam_module"]
@@ -82,7 +83,8 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
     if "data" not in config:
         config["data"] = {}
     config["data"]["scene_name"] = scene
-    config["data"]["input_path"] = f"data/input/Datasets/{dataset}/{scene}"
+    config["data"]["input_path"] = input_path if input_path else f"data/input/Datasets/{dataset}/{scene}"
+    config["online"] = online
 
     output_path = Path(f"data/output/{dataset}/")
 
@@ -109,7 +111,7 @@ def run_scene(scene: str, dataset: str, experiment_name: str, tmp_run: bool = Fa
 
     gen_utils.setup_seed(config["seed"])
     gslam = OVOSemMap(config, output_path=output_path)
-    gslam.run()
+    gslam.run_online() if online else gslam.run()
 
     if tmp_run:
         final_path = Path(f"data/output/{dataset}/") / experiment_name / scene
@@ -148,7 +150,8 @@ def main(args):
         input_path = f"./data/input/Datasets/{args.dataset_name}/{scene}"
         if args.run:
             t0 = time.time()
-            run_scene(scene, args.dataset_name, experiment_name, tmp_run = tmp_run)
+            run_scene(scene, args.dataset_name, experiment_name, tmp_run=tmp_run,
+                      online=args.online, input_path=args.input_path)
             t1 = time.time()
             print(f"Scene {scene} took: {t1-t0:.2f}")
         gc.collect()
@@ -179,5 +182,7 @@ if __name__ == "__main__":
     parser.add_argument('--segment', action='store_true', help="If set, use the reconstructed scene to segment the gt point-cloud, after running OVO.")
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--ignore_background', action='store_true',help="If set, does not use background ids from eval_info to compute metrics.")
+    parser.add_argument('--online', action='store_true', help="Run in streaming mode, tailing a growing ScanNet-style directory (e.g. produced live by keyframe_scannet_writer) instead of a finite pre-recorded dataset. Ends when a `STOP` file appears in the input directory.")
+    parser.add_argument('--input_path', type=str, default=None, help="Override the dataset input path (e.g. point directly at keyframe_scannet_writer's out_dir for --online runs).")
     args = parser.parse_args()
     main(args)

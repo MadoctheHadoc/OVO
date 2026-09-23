@@ -2,6 +2,7 @@
 """
 import math
 import os
+import time
 from pathlib import Path
 
 import cv2
@@ -86,43 +87,43 @@ class ScanNet(BaseDataset):
         self.depth_paths = sorted(list(
             (self.dataset_path / "depth").glob("*.png")), key=lambda x: int(os.path.basename(x)[:-4]))
         self.load_poses(self.dataset_path / "pose")
-        # Optional per-keyframe LiDAR sweep, when present it replaces the depth projection
+        # Optional per-keyframe LiDAR sweep, when present it replaces the depth
+        # projection. Coverage can be sparse (keyframe_scannet_writer only
+        # writes a sweep when the keyframe carries a cloud), so lidar is
+        # looked up by exact per-index filename in __getitem__, not by
+        # position in a glob list, to keep sparse frames aligned.
         lidar_dir = self.dataset_path / "lidar"
-        if lidar_dir.is_dir():
-            self.lidar_paths = sorted(
-                lidar_dir.glob("*.npy"),
-                key=lambda x: int(os.path.basename(x)[:-4]))
-        else:
-            self.lidar_paths = None
+        self.lidar_dir = lidar_dir if lidar_dir.is_dir() else None
         depth_th = dataset_config.get("depth_th",0)
         if depth_th >0:
             self.depth_th = depth_th
         else:
             self.depth_th = None
 
+    @staticmethod
+    def _read_pose_txt(path):
+        with open(path, "r") as f:
+            lines = f.readlines()
+        ls = [list(map(float, line.split(' '))) for line in lines]
+        return np.array(ls).reshape(4, 4).astype(np.float32)
+
     def load_poses(self, path):
-        self.poses = []
         pose_paths = sorted(path.glob('*.txt'),
                             key=lambda x: int(os.path.basename(x)[:-4]))
-        for pose_path in pose_paths:
-            with open(pose_path, "r") as f:
-                lines = f.readlines()
-            ls = []
-            for line in lines:
-                ls.append(list(map(float, line.split(' '))))
-            c2w = np.array(ls).reshape(4, 4).astype(np.float32)
-            self.poses.append(c2w)
+        self.poses = [self._read_pose_txt(p) for p in pose_paths]
 
-    def __getitem__(self, index):
-        color_data = cv2.imread(str(self.color_paths[index]))
+    def _decode_frame(self, index, color_path, depth_path, c2w, lidar_path=None):
+        """ Shared by `ScanNet` and `ScanNetOnline`: decode a color/depth pair
+        (plus optional LiDAR sweep) at already-resolved paths into a frame
+        tuple. """
+        color_data = cv2.imread(str(color_path))
         if self.distortion is not None:
             color_data = cv2.undistort(
                 color_data, self.intrinsics, self.distortion)
         color_data = cv2.cvtColor(color_data, cv2.COLOR_BGR2RGB)
         lr_color_data = cv2.resize(color_data, (self.dataset_config["W"], self.dataset_config["H"]))
 
-        depth_data = cv2.imread(
-            str(self.depth_paths[index]), cv2.IMREAD_UNCHANGED)
+        depth_data = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
         depth_data = depth_data.astype(np.float32) / self.depth_scale
         if self.depth_th is not None:
             depth_data[depth_data > self.depth_th] = 0
@@ -130,11 +131,62 @@ class ScanNet(BaseDataset):
         if edge > 0:
             lr_color_data = lr_color_data[edge:-edge, edge:-edge]
             depth_data = depth_data[edge:-edge, edge:-edge]
-        # Interpolate depth values for splatting
-        if self.lidar_paths is not None:
-            lidar_data = np.load(self.lidar_paths[index]).astype(np.float32)
-            return index, lr_color_data, depth_data, self.poses[index], color_data, lidar_data
-        return index, lr_color_data, depth_data, self.poses[index], color_data
+
+        if lidar_path is not None and lidar_path.exists():
+            lidar_data = np.load(lidar_path).astype(np.float32)
+            return index, lr_color_data, depth_data, c2w, color_data, lidar_data
+        return index, lr_color_data, depth_data, c2w, color_data
+
+    def __getitem__(self, index):
+        lidar_path = self.lidar_dir / f"{index:06d}.npy" if self.lidar_dir is not None else None
+        return self._decode_frame(
+            index, self.color_paths[index], self.depth_paths[index], self.poses[index], lidar_path)
+
+
+class ScanNetOnline(ScanNet):
+    """Reads a ScanNet-style directory while `keyframe_scannet_writer` (or
+    equivalent) is still filling it in, instead of globbing a fixed frame
+    list once at start-up.
+
+    Frames are located by index on demand: `__getitem__(index)` blocks,
+    polling every `poll_interval` seconds, until frame `index`'s color/depth/
+    pose files exist. Touch a `STOP` file inside `input_path` to end an
+    online run cleanly -- while waiting for a frame, its presence raises
+    `StopIteration` instead of blocking forever.
+    """
+
+    def __init__(self, dataset_config: dict):
+        BaseDataset.__init__(self, dataset_config)
+        self.color_dir = self.dataset_path / "color"
+        self.depth_dir = self.dataset_path / "depth"
+        self.pose_dir = self.dataset_path / "pose"
+        self.lidar_dir = self.dataset_path / "lidar"
+        self.stop_path = self.dataset_path / "STOP"
+        self.poll_interval = dataset_config.get("poll_interval", 0.2)
+        depth_th = dataset_config.get("depth_th", 0)
+        self.depth_th = depth_th if depth_th > 0 else None
+
+    def __len__(self):
+        highest = -1
+        if self.color_dir.is_dir():
+            for name in os.listdir(self.color_dir):
+                stem, ext = os.path.splitext(name)
+                if ext not in (".jpg", ".png") or not stem.isdigit():
+                    continue
+                highest = max(highest, int(stem))
+        return highest + 1
+
+    def __getitem__(self, index):
+        color_path = self.color_dir / f"{index:06d}.jpg"
+        depth_path = self.depth_dir / f"{index:06d}.png"
+        pose_path = self.pose_dir / f"{index:06d}.txt"
+        while not (color_path.exists() and depth_path.exists() and pose_path.exists()):
+            if self.stop_path.exists():
+                raise StopIteration(f"Stop marker found while waiting for frame {index}")
+            time.sleep(self.poll_interval)
+
+        c2w = self._read_pose_txt(pose_path)
+        return self._decode_frame(index, color_path, depth_path, c2w, self.lidar_dir / f"{index:06d}.npy")
 
 
 class ScanNetPP(BaseDataset):
@@ -249,3 +301,9 @@ def get_dataset(dataset_name: str):
     elif dataset_name == 'matterport':
         return Matterport
     raise NotImplementedError(f"Dataset {dataset_name} not implemented")
+
+
+def get_online_dataset(dataset_name: str):
+    if dataset_name.lower() == "scannet":
+        return ScanNetOnline
+    raise NotImplementedError(f"Online dataset {dataset_name} not implemented")

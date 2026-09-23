@@ -59,6 +59,7 @@ class VanillaMapper():
     def map(self, frame_data: List[Any], c2w: torch.Tensor) -> None:
         # unproject depth
         image, depth, pose = frame_data[1:4]
+        assert image.shape[:2] == depth.shape[:2], f"frame {frame_data[0]}: image {image.shape} depth {depth.shape}"
         # load depth camera intrinsics
         h = image.shape[0]
         w = image.shape[1]
