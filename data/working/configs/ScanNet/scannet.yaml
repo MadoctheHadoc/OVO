@@ -1,13 +1,23 @@
 # OVO-SLAM ScanNet camera config patched for the keyframe pipeline.
-# Modified from the original to match the rough specs of the camera
+# Intrinsics read from recordings/moving_test/intrinsic/000000.txt (static
+# across frames). Both color and depth are 1280x720 on disk for this
+# recording, so H/W here match depth's native resolution and color's
+# resize in ScanNet._decode_frame (to cam.W/H) is a no-op.
 dataset_name: "scannet"
 cam:
-  H: 720
-  W: 1280
-  fx: 610.8327
-  fy: 458.1246
-  cx: 640.0
-  cy: 360.0
+  H: 480
+  W: 640
+  fx: 606.938416
+  fy: 606.548523
+  cx: 330.555573
+  cy: 245.821609
+  #H: 720
+  #W: 1280
+  #fx: 610.8327
+  #fy: 458.1246
+  #cx: 640.0
+  #cy: 360.0
   depth_scale: 1000.
   depth_th: 8.0
   crop_edge: 0
+

@@ -275,3 +275,48 @@ def compute_frustum_point_ids(pts: torch.Tensor, frustum_corners: torch.Tensor, 
 
     inside_aabb_mask[inside_aabb_mask == 1] = inside_frustum_mask
     return torch.where(inside_aabb_mask)[0]
+
+
+def rasterize_lidar_to_depth(
+    lidar_xyz: np.ndarray,
+    h: int,
+    w: int,
+    intrinsics: np.ndarray,
+    crop_edge: int = 0,
+    depth_th: float = None,
+) -> np.ndarray:
+    """Project a camera-frame LiDAR sweep into a sparse HxW depth image.
+
+    Points are dropped if behind the camera, beyond `depth_th`, or projecting
+    outside the (cropped) image. When several returns hit one pixel the
+    nearest is kept. Plain numpy so it is safe to call from dataloader
+    workers (no CUDA context).
+
+    Args:
+        lidar_xyz: Nx3+ array of points in the camera optical frame.
+        h: Output image height.
+        w: Output image width.
+        intrinsics: 3x3 camera intrinsics matrix.
+        crop_edge: Pixels to exclude from each border.
+        depth_th: Optional max depth; farther points are dropped.
+
+    Returns:
+        HxW float32 depth image, 0 where no return landed.
+    """
+    pts = np.ascontiguousarray(lidar_xyz[:, :3]).astype(np.float32)
+    z = pts[:, 2]
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = np.round(fx * pts[:, 0] / z + cx).astype(np.int64)
+        v = np.round(fy * pts[:, 1] / z + cy).astype(np.int64)
+    valid = (z > 0) & (u >= crop_edge) & (u < w - crop_edge) & (v >= crop_edge) & (v < h - crop_edge)
+    if depth_th is not None:
+        valid &= z <= depth_th
+    u, v, z = u[valid], v[valid], z[valid]
+    depth = np.full(h * w, np.inf, dtype=np.float32)
+    flat = v * w + u
+    order = np.argsort(-z)  # farthest first -> nearest overwrites
+    depth[flat[order]] = z[order]
+    depth[np.isinf(depth)] = 0.0
+    return depth.reshape(h, w)

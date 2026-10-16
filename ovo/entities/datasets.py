@@ -11,6 +11,8 @@ import torch
 import json
 import imageio
 
+from ..utils.geometry_utils import rasterize_lidar_to_depth
+
 
 class BaseDataset(torch.utils.data.Dataset):
 
@@ -84,16 +86,27 @@ class ScanNet(BaseDataset):
         super().__init__(dataset_config)
         self.color_paths = sorted(list(
             (self.dataset_path / "color").glob("*.jpg")), key=lambda x: int(os.path.basename(x)[:-4]))
+        depth_dir = self.dataset_path / "depth"
+        # A scene recorded LiDAR-only (e.g. irl_downstairs) has no depth
+        # sensor at all: has_depth is False, depth_paths stays empty, and
+        # __getitem__ synthesizes a depth image from the LiDAR sweep instead
+        # of reading one from disk -- see _decode_frame.
+        self.has_depth = depth_dir.is_dir() and any(depth_dir.glob("*.png"))
         self.depth_paths = sorted(list(
-            (self.dataset_path / "depth").glob("*.png")), key=lambda x: int(os.path.basename(x)[:-4]))
+            depth_dir.glob("*.png")), key=lambda x: int(os.path.basename(x)[:-4])) if self.has_depth else []
         self.load_poses(self.dataset_path / "pose")
-        # Optional per-keyframe LiDAR sweep, when present it replaces the depth
-        # projection. Coverage can be sparse (keyframe_scannet_writer only
-        # writes a sweep when the keyframe carries a cloud), so lidar is
-        # looked up by exact per-index filename in __getitem__, not by
-        # position in a glob list, to keep sparse frames aligned.
+        # Optional per-keyframe LiDAR sweep. When a depth sensor is also
+        # present it replaces the depth projection (see VanillaMapper); when
+        # it's not, it's the only source of depth. Coverage can be sparse
+        # (keyframe_scannet_writer only writes a sweep when the keyframe
+        # carries a cloud), so lidar is looked up by exact per-index filename
+        # in __getitem__, not by position in a glob list, to keep sparse
+        # frames aligned.
         lidar_dir = self.dataset_path / "lidar"
         self.lidar_dir = lidar_dir if lidar_dir.is_dir() else None
+        if not self.has_depth and self.lidar_dir is None:
+            raise FileNotFoundError(
+                f"{self.dataset_path} has neither a depth/ directory nor a lidar/ directory")
         depth_th = dataset_config.get("depth_th",0)
         if depth_th >0:
             self.depth_th = depth_th
@@ -115,7 +128,14 @@ class ScanNet(BaseDataset):
     def _decode_frame(self, index, color_path, depth_path, c2w, lidar_path=None):
         """ Shared by `ScanNet` and `ScanNetOnline`: decode a color/depth pair
         (plus optional LiDAR sweep) at already-resolved paths into a frame
-        tuple. """
+        tuple. `depth_path` may be None (scene has no depth sensor), in which
+        case `lidar_path` is required and depth is synthesized by rasterizing
+        the sweep onto the camera plane -- the same projection
+        `VanillaMapper._rasterize_lidar` uses, so a lidar-only scene gets a
+        depth image consistent with what the mapper would have built, and
+        every consumer of frame depth (semantic association, frame-validity
+        gating, mapping) sees the same LiDAR-derived values instead of
+        depth-camera data. """
         color_data = cv2.imread(str(color_path))
         if self.distortion is not None:
             color_data = cv2.undistort(
@@ -123,24 +143,39 @@ class ScanNet(BaseDataset):
         color_data = cv2.cvtColor(color_data, cv2.COLOR_BGR2RGB)
         lr_color_data = cv2.resize(color_data, (self.dataset_config["W"], self.dataset_config["H"]))
 
-        depth_data = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-        depth_data = depth_data.astype(np.float32) / self.depth_scale
-        if self.depth_th is not None:
-            depth_data[depth_data > self.depth_th] = 0
+        lidar_data = None
+        if lidar_path is not None and lidar_path.exists():
+            lidar_data = np.load(lidar_path).astype(np.float32)
+
+        if depth_path is not None:
+            depth_data = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+            depth_data = depth_data.astype(np.float32) / self.depth_scale
+            if self.depth_th is not None:
+                depth_data[depth_data > self.depth_th] = 0
+        elif lidar_data is not None:
+            depth_data = rasterize_lidar_to_depth(
+                lidar_data, self.dataset_config["H"], self.dataset_config["W"],
+                self.intrinsics, crop_edge=0, depth_th=self.depth_th)
+        else:
+            # No depth sensor and no sweep for this keyframe: an all-zero
+            # depth makes `missing_depth` (ovomapping.py) skip the frame,
+            # same as a dropped depth-camera frame would today.
+            depth_data = np.zeros((self.dataset_config["H"], self.dataset_config["W"]), dtype=np.float32)
+
         edge = self.crop_edge
         if edge > 0:
             lr_color_data = lr_color_data[edge:-edge, edge:-edge]
             depth_data = depth_data[edge:-edge, edge:-edge]
 
-        if lidar_path is not None and lidar_path.exists():
-            lidar_data = np.load(lidar_path).astype(np.float32)
+        if lidar_data is not None:
             return index, lr_color_data, depth_data, c2w, color_data, lidar_data
         return index, lr_color_data, depth_data, c2w, color_data
 
     def __getitem__(self, index):
         lidar_path = self.lidar_dir / f"{index:06d}.npy" if self.lidar_dir is not None else None
+        depth_path = self.depth_paths[index] if self.has_depth else None
         return self._decode_frame(
-            index, self.color_paths[index], self.depth_paths[index], self.poses[index], lidar_path)
+            index, self.color_paths[index], depth_path, self.poses[index], lidar_path)
 
 
 class ScanNetOnline(ScanNet):
@@ -163,6 +198,9 @@ class ScanNetOnline(ScanNet):
         self.lidar_dir = self.dataset_path / "lidar"
         self.stop_path = self.dataset_path / "STOP"
         self.poll_interval = dataset_config.get("poll_interval", 0.2)
+        # LiDAR-only recording (no depth sensor): the writer never creates
+        # depth/, so don't wait on it -- see __getitem__.
+        self.has_depth = dataset_config.get("has_depth", True)
         depth_th = dataset_config.get("depth_th", 0)
         self.depth_th = depth_th if depth_th > 0 else None
 
@@ -178,15 +216,17 @@ class ScanNetOnline(ScanNet):
 
     def __getitem__(self, index):
         color_path = self.color_dir / f"{index:06d}.jpg"
-        depth_path = self.depth_dir / f"{index:06d}.png"
+        depth_path = self.depth_dir / f"{index:06d}.png" if self.has_depth else None
         pose_path = self.pose_dir / f"{index:06d}.txt"
-        while not (color_path.exists() and depth_path.exists() and pose_path.exists()):
+        lidar_path = self.lidar_dir / f"{index:06d}.npy"
+        required = [color_path, pose_path] + ([depth_path] if self.has_depth else [lidar_path])
+        while not all(p.exists() for p in required):
             if self.stop_path.exists():
                 raise StopIteration(f"Stop marker found while waiting for frame {index}")
             time.sleep(self.poll_interval)
 
         c2w = self._read_pose_txt(pose_path)
-        return self._decode_frame(index, color_path, depth_path, c2w, self.lidar_dir / f"{index:06d}.npy")
+        return self._decode_frame(index, color_path, depth_path, c2w, lidar_path)
 
 
 class ScanNetPP(BaseDataset):

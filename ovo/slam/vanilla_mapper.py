@@ -72,6 +72,8 @@ class VanillaMapper():
         else:
             depth  = torch.from_numpy(depth.astype(np.float32)).to(self.device)
         mask = depth > 0
+        if mask.sum() == 0:
+            return  # empty sweep/depth (e.g. no LiDAR returns in the camera FoV)
 
         if self.max_id>0:
             camera_frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
@@ -128,27 +130,14 @@ class VanillaMapper():
     def _rasterize_lidar(self, lidar_xyz: np.ndarray, h: int, w: int) -> torch.Tensor:
         """Project a camera-frame LiDAR sweep into a sparse HxW depth image.
 
-        Points are dropped if behind the camera, beyond ``cam.depth_th``, or
-        projecting outside the (cropped) image. When several returns hit one
-        pixel the nearest is kept.
+        Thin wrapper around `geometry_utils.rasterize_lidar_to_depth` (shared
+        with the dataset layer, which rasterises the same way when a scene
+        has no depth sensor at all).
         """
-        pts = torch.from_numpy(np.ascontiguousarray(lidar_xyz[:, :3])).float().to(self.device)
-        z = pts[:, 2]
-        fx, fy = self.cam_intrinsics[0, 0], self.cam_intrinsics[1, 1]
-        cx, cy = self.cam_intrinsics[0, 2], self.cam_intrinsics[1, 2]
-        u = torch.round(fx * pts[:, 0] / z + cx).long()
-        v = torch.round(fy * pts[:, 1] / z + cy).long()
-        edge = self.lidar_crop_edge
-        valid = (z > 0) & (u >= edge) & (u < w - edge) & (v >= edge) & (v < h - edge)
-        if self.lidar_depth_th is not None:
-            valid &= z <= self.lidar_depth_th
-        u, v, z = u[valid], v[valid], z[valid]
-        depth = torch.full((h * w,), float("inf"), device=self.device)
-        flat = v * w + u
-        order = torch.argsort(z, descending=True)  # farthest first -> nearest overwrites
-        depth[flat[order]] = z[order]
-        depth[torch.isinf(depth)] = 0.0
-        return depth.view(h, w)
+        depth = geometry_utils.rasterize_lidar_to_depth(
+            lidar_xyz, h, w, self.cam_intrinsics.cpu().numpy(),
+            crop_edge=self.lidar_crop_edge, depth_th=self.lidar_depth_th)
+        return torch.from_numpy(depth).to(self.device)
 
     def get_c2w(self, frame_id: int) -> torch.Tensor:
         c2w = self.estimated_c2ws.get(frame_id, None)

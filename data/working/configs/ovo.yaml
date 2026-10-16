@@ -15,11 +15,11 @@ vis:
   stream: False
   show_stream: False # this is going to be ignored if stream is false
 mapping:
-  map_every: 5 # ignored if slam.slam_module == orbslam2
+  map_every: 1 # ignored if slam.slam_module == orbslam2
 debug: True
 debug_info: True
 semantic:
-  segment_every: 10
+  segment_every: 1
   use_gt_masks: False
   use_gt_clips: False
   match_distance_th: 0.05 #0.01
